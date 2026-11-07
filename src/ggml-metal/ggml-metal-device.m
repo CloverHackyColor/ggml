@@ -1618,6 +1618,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_VIEW:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_PERMUTE:
+            // AMD Polaris workaround: force CPU fallback for memory ops to avoid EXC_BAD_ACCESS
+            if (!dev->props.has_simdgroup_reduction) {
+                return false;
+            }
             return true;
         case GGML_OP_CONCAT:
             {
@@ -1869,10 +1873,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return ggml_metal_supports_mul_mat_op(
                     has_simdgroup_reduction, op, false,
                     ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm));
+        case GGML_OP_CONT:
+            // AMD Polaris workaround: force CPU fallback for CONT to avoid EXC_BAD_ACCESS in ggml_metal_op_unary
+            if (!dev->props.has_simdgroup_reduction) {
+                return false;
+            }
+            // fallthrough            
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
-        case GGML_OP_CONT:
             {
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
