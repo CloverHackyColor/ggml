@@ -539,6 +539,9 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
 
 #define GGML_METAL_HOST_WRAP_MAX 256
 
+// bytes this process holds in private device buffers, across every Metal backend it made
+static atomic_size_t g_metal_live_bytes;
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 
@@ -1392,7 +1395,15 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total = dev->mtl_device.recommendedMaxWorkingSetSize;
-        *free  = *total - dev->mtl_device.currentAllocatedSize;
+        size_t used = dev->mtl_device.currentAllocatedSize;
+        // A discrete AMD driver keeps released buffers counted here for tens of seconds and
+        // can report more than the card holds, so a caller that sizes its work by the free
+        // figure refuses work that fits. What this backend still holds is the honest floor.
+        if (!dev->props.has_unified_memory && getenv("GGML_METAL_LIVE_BYTES_DISABLE") == NULL) {
+            const size_t live = atomic_load(&g_metal_live_bytes);
+            used = live < used ? live : used;
+        }
+        *free  = *total > used ? *total - used : 0;
     } else {
         *free = 0;
         *total = 0;
@@ -1950,6 +1961,9 @@ struct ggml_metal_buffer {
     void * all_data;
     size_t all_size;
 
+    // bytes this buffer adds to the device's live total (0 for host-mapped ones)
+    size_t counted_bytes;
+
     // if false, the Metal buffer data is allocated in private GPU memory and is not shared with the host
     bool is_shared;
     bool owned;
@@ -2132,6 +2146,11 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
     ggml_metal_device_rsets_add(dev, res->rset);
 
+    if (!res->is_shared) {
+        res->counted_bytes = res->all_size;
+        atomic_fetch_add(&g_metal_live_bytes, res->counted_bytes);
+    }
+
     //ggml_metal_log_allocated_size(device, size_aligned);
 
     return res;
@@ -2233,6 +2252,11 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    if (buf->counted_bytes > 0) {
+        atomic_fetch_sub(&g_metal_live_bytes, buf->counted_bytes);
+        buf->counted_bytes = 0;
+    }
+
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
     for (int i = 0; i < buf->n_buffers; i++) {
