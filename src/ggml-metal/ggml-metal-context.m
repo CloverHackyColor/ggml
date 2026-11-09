@@ -1132,6 +1132,11 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    const char * ncb_env = getenv("GGML_METAL_NCB");
+    if (ncb_env) {
+        const int v = atoi(ncb_env);
+        if (v > 0) { n_cb = v; }
+    }
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 

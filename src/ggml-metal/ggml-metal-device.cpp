@@ -838,7 +838,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     // attention matmuls read a permuted KV cache view and can exceed half range in the packed
     // accumulator; bfloat has no native arithmetic here, so float is faster for it too
-    const bool acc_f32 = use_mm_manual && (!ggml_is_contiguous(op->src[0]) || tsrc0 == GGML_TYPE_BF16);
+    // diffusion activations overflow half partials, so always accumulate in float here
+    const bool acc_f32 = use_mm_manual;
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), wide ? "_w" : "");
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_mm=%d_db=%d_af=%d",
@@ -1139,7 +1140,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
 
     const bool use_mm_manual = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->use_mm_manual;
 
-    const bool acc_f32 = use_mm_manual && (!ggml_is_contiguous(op->src[0]) || tsrc0 == GGML_TYPE_BF16);
+    // diffusion activations overflow half partials, so always accumulate in float here
+    const bool acc_f32 = use_mm_manual;
 
     snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     snprintf(name, 256, "%s_bci=%d_mm=%d_af=%d", base, bc_inp, use_mm_manual, acc_f32);
