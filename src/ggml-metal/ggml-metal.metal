@@ -9303,6 +9303,47 @@ kernel void kernel_cpy_contig_t_t(
     ((device T1 *) dst)[i] = cpy_cast<T1>(((device const T0 *) src0)[i]);
 }
 
+// a copy that swaps two contiguous blocks of dims is a transpose of an R x S matrix: go through
+// 32x32 tiles so that both the reads and the writes are contiguous
+template<typename T>
+kernel void kernel_cpy_transpose(
+        constant ggml_metal_kargs_cpy_transpose & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup T tile[32][33];
+
+    const int64_t s0 = (int64_t) tgpig.x*32;
+    const int64_t r0 = (int64_t) tgpig.y*32;
+
+    device const T * src = (device const T *) src0;
+    device       T * out = (device       T *) dst;
+
+    for (int k = 0; k < 32; k += 8) {
+        const int64_t r = r0 + tpitg.y + k;
+        const int64_t s = s0 + tpitg.x;
+        if (r < args.R && s < args.S) {
+            tile[tpitg.y + k][tpitg.x] = src[r*args.S + s];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 0; k < 32; k += 8) {
+        const int64_t s = s0 + tpitg.y + k;
+        const int64_t r = r0 + tpitg.x;
+        if (r < args.R && s < args.S) {
+            out[s*args.R + r] = tile[tpitg.x][tpitg.y + k];
+        }
+    }
+}
+
+typedef decltype(kernel_cpy_transpose<float>) kernel_cpy_transpose_t;
+
+template [[host_name("kernel_cpy_transpose_f32")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose<float>;
+template [[host_name("kernel_cpy_transpose_f16")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose<half>;
+
 typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
 
 template [[host_name("kernel_cpy_contig_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   float>;

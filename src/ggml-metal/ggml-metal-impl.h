@@ -293,6 +293,11 @@ typedef struct {
 } ggml_metal_kargs_cpy;
 
 typedef struct {
+    int64_t R; // product of the dims before the swap: the fast dim of dst
+    int64_t S; // product of the dims after it: the fast dim of src
+} ggml_metal_kargs_cpy_transpose;
+
+typedef struct {
     int64_t  ne10;
     int64_t  ne11;
     int64_t  ne12;

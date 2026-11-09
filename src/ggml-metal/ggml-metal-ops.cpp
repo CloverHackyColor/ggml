@@ -2097,6 +2097,43 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// A view that swaps two contiguous blocks of dims (dims [0, k) after [k, 4) in memory) copies
+// as a transpose of an R x S matrix; dims of size 1 have no stride to check.
+static bool tosh_cpy_as_transpose(const ggml_tensor * src, const ggml_tensor * dst, int64_t & R, int64_t & S) {
+    if (src->type != dst->type || (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) ||
+        !ggml_is_contiguous(dst) || ggml_is_contiguous(src)) {
+        return false;
+    }
+    const size_t es = ggml_type_size(src->type);
+    for (int k = 1; k < 4; ++k) {
+        int64_t r = 1, s = 1;
+        for (int i = 0; i < k; ++i) r *= src->ne[i];
+        for (int i = k; i < 4; ++i) s *= src->ne[i];
+        if (r == 1 || s == 1) {
+            continue;
+        }
+        bool ok = true;
+        size_t expect = es;
+        for (int i = k; i < 4 && ok; ++i) {
+            if (src->ne[i] == 1) continue;
+            ok = src->nb[i] == expect;
+            expect *= src->ne[i];
+        }
+        expect = es*s;
+        for (int i = 0; i < k && ok; ++i) {
+            if (src->ne[i] == 1) continue;
+            ok = src->nb[i] == expect;
+            expect *= src->ne[i];
+        }
+        if (ok) {
+            R = r;
+            S = s;
+            return true;
+        }
+    }
+    return false;
+}
+
 int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2107,6 +2144,23 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    static const bool transpose_off = getenv("TOSH_CPY_TRANSPOSE_DISABLE") != nullptr;
+    int64_t tR = 0, tS = 0;
+    if (!transpose_off && tosh_cpy_as_transpose(op->src[0], op, tR, tS)) {
+        ggml_metal_kargs_cpy_transpose args_t = { /*.R =*/ tR, /*.S =*/ tS };
+
+        auto pipeline_t = ggml_metal_library_get_pipeline_cpy_transpose(lib, op->type);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline_t);
+        ggml_metal_encoder_set_bytes   (enc, &args_t, sizeof(args_t), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (tS + 31)/32, (tR + 31)/32, 1, 32, 8, 1);
+
+        return 1;
+    }
 
     // a fully contiguous copy is one flat range: the generic kernel spends its instructions
     // recomputing 4-D indices for every element instead
