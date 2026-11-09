@@ -701,7 +701,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
 static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    ggml_metal_t ctx = ggml_metal_init(ctx_dev);
+    ggml_metal_t ctx = ggml_metal_init(ctx_dev, params != NULL && strcmp(params, "prefetch") == 0);
     if (ctx == NULL) {
         GGML_LOG_ERROR("%s: error: failed to allocate context\n", __func__);
         return NULL;

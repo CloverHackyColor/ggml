@@ -475,18 +475,23 @@ void quantize_iq4_nl(device const float * src, device block_iq4_nl & dst) {
 
 template <typename type4x4>
 void dequantize_q4_1(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
-    device const uint16_t * qs = ((device const uint16_t *)xb + 2);
+    // packed: the block is 20 bytes, so qs is only 4-byte aligned
+    device const packed_ushort4 * qs = (device const packed_ushort4 *)((device const uint16_t *)xb + 2);
     const float d1 = il ? (xb->d / 16.h) : xb->d;
     const float d2 = d1 / 256.f;
     const float  m = xb->m;
     const ushort mask0 = il ? 0x00F0 : 0x000F;
     const ushort mask1 = mask0 << 8;
 
+    const ushort4 q0 = ushort4(qs[0]);
+    const ushort4 q1 = ushort4(qs[1]);
+
     float4x4 reg_f;
 
     for (int i = 0; i < 8; i++) {
-        reg_f[i/2][2*(i%2) + 0] = ((qs[i] & mask0) * d1) + m;
-        reg_f[i/2][2*(i%2) + 1] = ((qs[i] & mask1) * d2) + m;
+        const ushort qsi = i < 4 ? q0[i] : q1[i - 4];
+        reg_f[i/2][2*(i%2) + 0] = ((qsi & mask0) * d1) + m;
+        reg_f[i/2][2*(i%2) + 1] = ((qsi & mask1) * d2) + m;
     }
 
     reg = (type4x4) reg_f;

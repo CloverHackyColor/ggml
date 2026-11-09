@@ -1732,18 +1732,94 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]);
-        case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
+        case GGML_OP_SSM_CONV:
+            // wave64: per-thread serial dot, no simdgroup reduction needed.
+            return has_simdgroup_reduction || wave64_decode;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+            // wave64: the kernel reduces within 32-lane halves (gdn_sum32).
+            return (has_simdgroup_reduction || wave64_decode) && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            // wave64: the kernel takes the real simd width as a function constant.
+            return has_simdgroup_reduction || wave64_decode;
+        case GGML_OP_MUL_MAT: {
+            if (op->src[0]->type == GGML_TYPE_NVFP4) {
+                return false;
+            }
+            if (has_simdgroup_reduction) {
+                return true;
+            }
+            // wave64 prefill: the manual tiled mul_mm (batched). Mirror the dispatch check.
+            const bool prefill =
+                use_mm_manual &&
+                !ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) &&
+                op->src[0]->ne[0] >= 64 && op->src[1]->ne[1] > 8;
+            // wave64 decode (experimental, opt-in): the width-parameterized mat-vec kernels.
+            const bool decode =
+                wave64_decode && op->src[0]->ne[0] >= 32 &&
+                (op->src[0]->type == GGML_TYPE_F16 ||
+                 op->src[0]->type == GGML_TYPE_F32 ||
+                 op->src[0]->type == GGML_TYPE_BF16 ||
+                 op->src[0]->type == GGML_TYPE_Q8_0 ||
+                 op->src[0]->type == GGML_TYPE_Q4_K ||
+                 op->src[0]->type == GGML_TYPE_Q5_K ||
+                 op->src[0]->type == GGML_TYPE_Q6_K ||
+                 op->src[0]->type == GGML_TYPE_Q2_K ||
+                 op->src[0]->type == GGML_TYPE_Q3_K ||
+                 op->src[0]->type == GGML_TYPE_MXFP4 ||
+                 op->src[0]->type == GGML_TYPE_IQ2_XXS ||
+                 op->src[0]->type == GGML_TYPE_IQ2_XS ||
+                 op->src[0]->type == GGML_TYPE_IQ3_XXS ||
+                 op->src[0]->type == GGML_TYPE_IQ3_S ||
+                 op->src[0]->type == GGML_TYPE_IQ2_S ||
+                 op->src[0]->type == GGML_TYPE_IQ1_S ||
+                 op->src[0]->type == GGML_TYPE_IQ1_M ||
+                 op->src[0]->type == GGML_TYPE_IQ4_NL ||
+                 op->src[0]->type == GGML_TYPE_IQ4_XS ||
+                 op->src[0]->type == GGML_TYPE_Q4_0 ||
+                 op->src[0]->type == GGML_TYPE_Q4_1 ||
+                 op->src[0]->type == GGML_TYPE_Q5_0 ||
+                 op->src[0]->type == GGML_TYPE_Q5_1);
+            return prefill || decode;
+        }
+        case GGML_OP_MUL_MAT_ID: {
+            if (op->src[0]->type == GGML_TYPE_NVFP4) {
+                return false;
+            }
+            if (has_simdgroup_reduction) {
+                return true;
+            }
+            // wave64: mul_mv_id reuses the width-parameterized decode impls and the
+            // manual mm_id prefill uses virtual 32-wide indices; both run on the GPU.
+            return wave64_decode && op->src[0]->ne[0] >= 32 &&
+                (op->src[0]->type == GGML_TYPE_F16 ||
+                 op->src[0]->type == GGML_TYPE_F32 ||
+                 op->src[0]->type == GGML_TYPE_BF16 ||
+                 op->src[0]->type == GGML_TYPE_Q8_0 ||
+                 op->src[0]->type == GGML_TYPE_Q4_K ||
+                 op->src[0]->type == GGML_TYPE_Q5_K ||
+                 op->src[0]->type == GGML_TYPE_Q6_K ||
+                 op->src[0]->type == GGML_TYPE_Q2_K ||
+                 op->src[0]->type == GGML_TYPE_Q3_K ||
+                 op->src[0]->type == GGML_TYPE_MXFP4 ||
+                 op->src[0]->type == GGML_TYPE_IQ2_XXS ||
+                 op->src[0]->type == GGML_TYPE_IQ2_XS ||
+                 op->src[0]->type == GGML_TYPE_IQ3_XXS ||
+                 op->src[0]->type == GGML_TYPE_IQ3_S ||
+                 op->src[0]->type == GGML_TYPE_IQ2_S ||
+                 op->src[0]->type == GGML_TYPE_IQ1_S ||
+                 op->src[0]->type == GGML_TYPE_IQ1_M ||
+                 op->src[0]->type == GGML_TYPE_IQ4_NL ||
+                 op->src[0]->type == GGML_TYPE_IQ4_XS ||
+                 op->src[0]->type == GGML_TYPE_Q4_0 ||
+                 op->src[0]->type == GGML_TYPE_Q4_1 ||
+                 op->src[0]->type == GGML_TYPE_Q5_0 ||
+                 op->src[0]->type == GGML_TYPE_Q5_1);
+        }
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:

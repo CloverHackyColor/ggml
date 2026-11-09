@@ -1317,8 +1317,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             }
     };
 
+    // wave64 decode: MoE experts reuse the same width-parameterized mat-vec impls,
+    // so run them on a 64-wide simdgroup (nw) like the dense mul_mv path.
+    auto * props_id = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+    int16_t nw = 32;
+    if (props_id->wave64_decode) {
+        const bool helper = (tsrc0 == GGML_TYPE_F16 || tsrc0 == GGML_TYPE_F32 ||
+                             tsrc0 == GGML_TYPE_BF16 || tsrc0 == GGML_TYPE_Q8_0);
+        const bool sr     = (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q6_K ||
+                             tsrc0 == GGML_TYPE_Q2_K || tsrc0 == GGML_TYPE_Q3_K ||
+                             tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q4_1 ||
+                             tsrc0 == GGML_TYPE_Q5_0 || tsrc0 == GGML_TYPE_Q5_1 ||
+                             tsrc0 == GGML_TYPE_IQ2_XXS || tsrc0 == GGML_TYPE_IQ2_XS ||
+                             tsrc0 == GGML_TYPE_IQ3_XXS || tsrc0 == GGML_TYPE_IQ3_S ||
+                             tsrc0 == GGML_TYPE_IQ2_S || tsrc0 == GGML_TYPE_IQ1_S ||
+                             tsrc0 == GGML_TYPE_IQ1_M);
+        const bool lut = (tsrc0 == GGML_TYPE_MXFP4 || tsrc0 == GGML_TYPE_IQ4_NL || tsrc0 == GGML_TYPE_IQ4_XS);
+        if (helper) { nw = (int16_t) props_id->simd_width; smem = (size_t) nw*sizeof(float)*nr0; }
+        else if (sr) { nw = (int16_t) props_id->simd_width; }
+        else if (lut) { nw = (int16_t) props_id->simd_width; smem = (size_t) nw*sizeof(float); }
+    }
+
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d", base, nsg);
+    snprintf(name, 256, "%s_nsg=%d_nw=%d", base, nsg, nw);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1328,6 +1349,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 2);
         ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 4);
+        ggml_metal_cv_set_int16(cv, nw,  FC_MUL_MV + 5);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
