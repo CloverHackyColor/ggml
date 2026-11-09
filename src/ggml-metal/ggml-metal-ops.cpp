@@ -4208,6 +4208,25 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
+    if (((const int32_t *) op->op_params)[2] == GGML_ROPE_TYPE_TABLE) {
+        ggml_metal_kargs_rope args = {};
+        args.ne00 = ne00; args.ne01 = ne01; args.ne02 = ne02;
+        args.nb01 = nb01; args.nb02 = nb02;
+        args.nb1  = nb1;  args.nb2  = nb2;
+
+        auto pipeline = ggml_metal_library_get_pipeline_rope_table(lib);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, 1, std::min(1024, ne00/2), 1, 1);
+
+        return 1;
+    }
+
     // make sure we have one or more position id(ne10) per token(ne02)
     GGML_ASSERT(ne10 % ne02 == 0);
     GGML_ASSERT(ne10 >= ne02);

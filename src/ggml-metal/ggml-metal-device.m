@@ -1567,6 +1567,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             // the real width), so allow them on GPU behind the decode opt-in.
             return (has_simdgroup_reduction || wave64_decode) && (ggml_is_contiguous_rows(op->src[0]));
         case GGML_OP_ROPE:
+            if (((const int32_t *) op->op_params)[2] == GGML_ROPE_TYPE_TABLE) {
+                return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) &&
+                       op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]);
+            }
+            return true;
         case GGML_OP_ROPE_BACK:
             return true;
         case GGML_OP_IM2COL:

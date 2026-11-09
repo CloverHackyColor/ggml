@@ -5141,6 +5141,31 @@ kernel void kernel_rope_vision(
 }
 
 typedef decltype(kernel_rope_norm<float>) kernel_rope_norm_t;
+
+// One threadgroup per (head, position): rotates each adjacent pair by its table entry and writes
+// the row where the head-major output wants it.
+kernel void kernel_rope_table_f32(
+        constant ggml_metal_kargs_rope & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int h = tgpig.x;
+    const int p = tgpig.y;
+    const int n_pairs = args.ne00/2;
+
+    device const float2 * x = (device const float2 *) (src0 + h*args.nb01 + p*args.nb02);
+    device const float4 * t = (device const float4 *) src1 + p*n_pairs;
+    device       float2 * y = (device       float2 *) (dst + p*args.nb1 + h*args.nb2);
+
+    for (int i = tiitg; i < n_pairs; i += ntg.x) {
+        const float2 v = x[i];
+        const float4 c = t[i];
+        y[i] = float2(v.x*c.x + v.y*c.y, v.x*c.z + v.y*c.w);
+    }
+}
 typedef decltype(kernel_rope_neox<float>) kernel_rope_neox_t;
 typedef decltype(kernel_rope_multi<float>) kernel_rope_multi_t;
 typedef decltype(kernel_rope_vision<float>) kernel_rope_vision_t;
