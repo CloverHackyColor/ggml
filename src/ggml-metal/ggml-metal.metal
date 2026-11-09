@@ -4156,14 +4156,15 @@ void kernel_mul_mv_ext_q4_f32_impl(
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  sgptg[[threads_per_simdgroup]]) {
     const short NSG   = FC_mul_mv_nsg;
     const short nxpsg = FC_mul_mv_nxpsg;
 
     const short chpt = 4; // chunks per thread
 
-  //const short nxpsg = (32);
-    const short nypsg = (32/nxpsg);
+    // wave64: derive the row split from the real simdgroup width, not a fixed 32
+    const short nypsg = (sgptg/nxpsg);
 
     const short tx = tiisg%nxpsg;
     const short ty = tiisg/nxpsg;
@@ -4260,14 +4261,15 @@ void kernel_mul_mv_ext_q4x4_f32_impl(
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  sgptg[[threads_per_simdgroup]]) {
     const short NSG   = FC_mul_mv_nsg;
     const short nxpsg = FC_mul_mv_nxpsg;
 
     const short chpt = 1;
 
-  //const short nxpsg = (32);
-    const short nypsg = (32/nxpsg);
+    // wave64: derive the row split from the real simdgroup width, not a fixed 32
+    const short nypsg = (sgptg/nxpsg);
 
     const short tx = tiisg%nxpsg;
     const short ty = tiisg/nxpsg;
@@ -4392,8 +4394,9 @@ kernel void kernel_mul_mv_ext_q4_f32_disp(
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_ext_q4_f32_impl<r1ptg, q_t, epb/4, deq_t4>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  sgptg[[threads_per_simdgroup]]) {
+    kernel_mul_mv_ext_q4_f32_impl<r1ptg, q_t, epb/4, deq_t4>(args, src0, src1, dst, tgpig, tiisg, sgitg, sgptg);
 }
 
 template<short r1ptg, short nr0, typename q_t, short epb, void (*deq_t4x4)(device const q_t *, short, thread float4x4 &)>
@@ -4404,8 +4407,9 @@ kernel void kernel_mul_mv_ext_q4x4_f32_disp(
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_ext_q4x4_f32_impl<r1ptg, nr0, q_t, epb/16, deq_t4x4>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  sgptg[[threads_per_simdgroup]]) {
+    kernel_mul_mv_ext_q4x4_f32_impl<r1ptg, nr0, q_t, epb/16, deq_t4x4>(args, src0, src1, dst, tgpig, tiisg, sgitg, sgptg);
 }
 
 typedef decltype(kernel_mul_mv_ext_q4_f32_disp  <2, block_q8_0, 32,  dequantize_q8_0_t4>) mul_mv_ext_q4_f32_t;
@@ -12740,12 +12744,13 @@ void kernel_mul_mv_ext_q4_K_raw_f32_impl(
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  sgptg[[threads_per_simdgroup]]) {
     const short NSG   = FC_mul_mv_nsg;
     const short nxpsg = FC_mul_mv_nxpsg;
 
     const short chpb  = 16;
-    const short nypsg = (32/nxpsg);
+    const short nypsg = (sgptg/nxpsg);
 
     const short tx = tiisg%nxpsg;
     const short ty = tiisg/nxpsg;
@@ -12927,8 +12932,9 @@ kernel void kernel_mul_mv_ext_q4_K_raw_f32_disp(
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_ext_q4_K_raw_f32_impl<r1ptg, nr0>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  sgptg[[threads_per_simdgroup]]) {
+    kernel_mul_mv_ext_q4_K_raw_f32_impl<r1ptg, nr0>(args, src0, src1, dst, tgpig, tiisg, sgitg, sgptg);
 }
 
 template [[host_name("kernel_mul_mv_ext_q4_K_raw_f32_r1_2")]]       kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4_K_raw_f32_disp<2, 1>;
@@ -13056,12 +13062,13 @@ void kernel_mul_mv_ext_qK_hdr_f32_impl(
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  sgptg[[threads_per_simdgroup]]) {
     const short NSG   = FC_mul_mv_nsg;
     const short nxpsg = FC_mul_mv_nxpsg;
 
     const short chpb  = 16;
-    const short nypsg = (32/nxpsg);
+    const short nypsg = (sgptg/nxpsg);
 
     const short tx = tiisg%nxpsg;
     const short ty = tiisg/nxpsg;
@@ -13181,8 +13188,9 @@ kernel void kernel_mul_mv_ext_qK_hdr_f32_disp(
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_ext_qK_hdr_f32_impl<r1ptg, nr0, q_t>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  sgptg[[threads_per_simdgroup]]) {
+    kernel_mul_mv_ext_qK_hdr_f32_impl<r1ptg, nr0, q_t>(args, src0, src1, dst, tgpig, tiisg, sgitg, sgptg);
 }
 
 template [[host_name("kernel_mul_mv_ext_q5_K_hdr_f32_r1_2")]]       kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_qK_hdr_f32_disp<2, 1, block_q5_K>;

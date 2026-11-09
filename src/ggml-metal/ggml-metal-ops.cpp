@@ -2355,9 +2355,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    // wave64: the ext kernel hardcodes a 32-lane split; skip it so these fall to the
-    // width-parameterized mat-vec below (correct, slightly slower). No-op on wave32.
-    if (props_dev->simd_width == 32 &&
+    // ext kernel derives its row split from the simdgroup width, so it runs on both
+    // wave32 and wave64. wave64 rides on wave64_decode (matches the mat-vec gating).
+    static const bool ext_disabled = getenv("TOSH_EXT_DISABLE") != nullptr;
+    if (!ext_disabled &&
+        (props_dev->simd_width == 32 || (props_dev->simd_width == 64 && props_dev->wave64_decode)) &&
         op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
          (
@@ -2407,7 +2409,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nxpsg = 4;
         }
 
-        const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
+        const int16_t nypsg  = props_dev->simd_width/nxpsg;   // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
               int16_t r1ptg  = 4;                 // num src1 rows per threadgroup
 
         // note: not sure how optimal are those across all different hardware. there might be something cleverer
@@ -2471,7 +2473,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, props_dev->simd_width, nsg, 1);
     } else if (
         !ggml_is_transposed(op->src[0]) &&
         !ggml_is_transposed(op->src[1]) &&
