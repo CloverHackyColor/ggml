@@ -128,12 +128,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, enum ggml_op op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_decode   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg, int nr0);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
@@ -258,7 +259,17 @@ struct ggml_metal_device_props {
 
     bool has_simdgroup_reduction;
     bool has_simdgroup_mm;
+    bool use_mm_manual;
     bool has_unified_memory;
+    // wave64 decode (experimental, opt-in): run the parameterized f16/q8_0 mat-vec
+    // kernels on the GPU for GCN/Vega instead of falling back to the CPU.
+    bool wave64_decode;
+
+    // Hardware SIMD-group width (threadExecutionWidth), probed at init.
+    // Apple Silicon and AMD RDNA report 32; AMD GCN/Vega report 64. The Metal
+    // kernels assume 32, so a non-32 width signals a wave64 device.
+    int simd_width;
+
     bool has_bfloat;
     bool has_tensor;
     bool use_residency_sets;
@@ -283,6 +294,15 @@ ggml_metal_device_t ggml_metal_device_get(int device);
 
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
+
+// per-context queue: the first context gets the shared device queue, later
+// ones an owned queue so their uploads can overlap compute
+void * ggml_metal_device_acquire_queue(ggml_metal_device_t dev, bool * owned); // id<MTLCommandQueue>
+void   ggml_metal_device_release_queue(ggml_metal_device_t dev, void * queue_raw, bool owned);
+
+// cached no-copy wrap of the host pages containing [data, data + size);
+// returns the id<MTLBuffer> (borrowed) and the blit offset, NULL on failure
+void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, size_t size, size_t * offs);
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
@@ -316,6 +336,21 @@ bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void   ggml_metal_buffer_get_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
+// small host<->device transfers through the device's persistent staging buffer
+// (synchronous); false when the size exceeds the stage, so callers fall back
+bool   ggml_metal_device_stage_set(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_dst, const void * data, size_t size);
+bool   ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_src, void * data, size_t size);
+
+// TOSH_MOE_PROFILE: per-tensor-name transfer accounting; no-op when disabled
+void   ggml_metal_prof_note(const char * name, size_t size, bool d2h);
+
+// batch small synchronous reads into one device round-trip
+void   ggml_metal_device_read_batch_begin(ggml_metal_device_t dev);
+void   ggml_metal_device_read_batch_end  (ggml_metal_device_t dev);
+
+// wait out the in-flight staged uploads (stage_set defers its waits)
+void   ggml_metal_device_upload_drain(ggml_metal_device_t dev);
 bool   ggml_metal_buffer_cpy_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * src, struct ggml_tensor * dst);
 void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 

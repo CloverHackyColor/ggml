@@ -18,6 +18,7 @@
 
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
+#define GGML_METAL_MAX_PREFETCH_STAGES 8
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
@@ -29,7 +30,34 @@ struct ggml_metal {
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
 
+    // shared device queue, or an owned one for secondary (prefetch) contexts
+    // so their uploads overlap the primary context's compute
+    id<MTLCommandQueue> queue;
+    bool owns_queue;
+    bool is_prefetch;
+
+    // Bounded host-visible source ring for expert uploads. Keeping one no-copy
+    // MTLBuffer per CPU tensor can pin many GiB of host pages on discrete GPUs.
+    id<MTLBuffer>        prefetch_stages[GGML_METAL_MAX_PREFETCH_STAGES];
+    id<MTLCommandBuffer> prefetch_stage_cmds[GGML_METAL_MAX_PREFETCH_STAGES];
+    int prefetch_stage_count;
+    int prefetch_stage_cur;
+
     ggml_metal_event_t ev_cpy; // for async copies
+
+    // Synchronization and resources shared by both cross-device copy paths.
+    struct ggml_metal_xdev_link {
+        ggml_metal_device_t  src_dev;
+        void *               host;
+        size_t               cap;
+        id<MTLBuffer>        wrap_src, wrap_dst;
+        // Retaining the source keeps its cached remote view valid.
+        id<MTLBuffer>        peer_src, peer_view;
+        id<MTLSharedEvent>   ev_ready, ev_done;
+        uint64_t             seq;
+        bool                 peer_logged;
+    } xlinks[4];
+    int n_xlinks;
 
     dispatch_queue_t d_queue;
 
@@ -81,7 +109,7 @@ struct ggml_metal {
     bool has_error;
 };
 
-ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+ggml_metal_t ggml_metal_init(ggml_metal_device_t dev, bool prefetch) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
 
 #if TARGET_OS_OSX && !GGML_METAL_NDEBUG
@@ -103,10 +131,18 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     // TODO: would it be better to have one queue for the backend and one queue for the device?
     //       the graph encoders and async ops would use the backend queue while the sync ops would use the device queue?
     //res->queue = [device newCommandQueue]; [TAG_QUEUE_PER_BACKEND]
-    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(dev);
-    if (queue == nil) {
+    res->queue = prefetch ? ggml_metal_device_acquire_queue(dev, &res->owns_queue)
+                          : ggml_metal_device_get_queue(dev);
+    if (res->queue == nil) {
         GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
+        free(res);
         return NULL;
+    }
+    res->is_prefetch = prefetch;
+    if (prefetch) {
+        const char * val = getenv("GGML_METAL_PREFETCH_STAGE_COUNT");
+        const int requested = val ? atoi(val) : 1;
+        res->prefetch_stage_count = MAX(1, MIN(requested, GGML_METAL_MAX_PREFETCH_STAGES));
     }
 
     res->dev = dev;
@@ -134,7 +170,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
-    res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+
+    // discrete GPUs (AMD) corrupt their output with a concurrent encoder: the driver does
+    // not honour the memory barrier. GGML_METAL_CONCURRENCY_ENABLE forces it back on to test.
+    res->use_concurrency = props_dev->has_unified_memory
+        ? getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil
+        : getenv("GGML_METAL_CONCURRENCY_ENABLE")  != nil;
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -189,6 +230,27 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
+    for (int i = 0; i < ctx->prefetch_stage_count; ++i) {
+        if (ctx->prefetch_stage_cmds[i]) {
+            [ctx->prefetch_stage_cmds[i] waitUntilCompleted];
+            [ctx->prefetch_stage_cmds[i] release];
+        }
+        [ctx->prefetch_stages[i] release];
+    }
+
+    for (int i = 0; i < ctx->n_xlinks; ++i) {
+        if (ctx->xlinks[i].seq > 0) {
+            [ctx->xlinks[i].ev_done waitUntilSignaledValue:ctx->xlinks[i].seq timeoutMS:10000];
+        }
+        [ctx->xlinks[i].wrap_src release];
+        [ctx->xlinks[i].wrap_dst release];
+        [ctx->xlinks[i].peer_view release];
+        [ctx->xlinks[i].peer_src release];
+        [ctx->xlinks[i].ev_ready release];
+        [ctx->xlinks[i].ev_done release];
+        free(ctx->xlinks[i].host);
+    }
+
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
             [ctx->cmd_bufs[i].obj release];
@@ -223,7 +285,7 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     Block_release(ctx->encode_async);
 
-    //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
+    ggml_metal_device_release_queue(ctx->dev, ctx->queue, ctx->owns_queue);
 
     dispatch_release(ctx->d_queue);
 
@@ -242,6 +304,9 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }
+
+    // in-flight staged uploads count as pending backend operations
+    ggml_metal_device_upload_drain(ctx->dev);
 
     // check status of all command buffers
     {
@@ -292,6 +357,13 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
 
         [ctx->cmd_bufs_ext removeAllObjects];
     }
+
+    for (int i = 0; i < ctx->prefetch_stage_count; ++i) {
+        if (ctx->prefetch_stage_cmds[i]) {
+            [ctx->prefetch_stage_cmds[i] release];
+            ctx->prefetch_stage_cmds[i] = nil;
+        }
+    }
 }
 
 static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_tensor * t) {
@@ -304,15 +376,18 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
     return ggml_metal_buffer_get_id(buffer->context, t);
 }
 
+void ggml_metal_read_batch_begin(ggml_metal_t ctx) {
+    ggml_metal_device_read_batch_begin(ctx->dev);
+}
+
+void ggml_metal_read_batch_end(ggml_metal_t ctx) {
+    ggml_metal_device_read_batch_end(ctx->dev);
+}
+
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     @autoreleasepool {
-        // wrap the source data into a Metal buffer
+        ggml_metal_prof_note(tensor->name, size, false);
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_src = [device newBufferWithBytes:data
-                                                    length:size
-                                                   options:MTLResourceStorageModeShared];
-
-        GGML_ASSERT(buf_src);
 
         struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(tensor);
         if (bid_dst.metal == nil) {
@@ -321,9 +396,80 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
         bid_dst.offs += offset;
 
+        // Expert prefetch keeps the zero-copy source path while it fits the
+        // device budget, then falls back to a bounded shared staging ring.
+        if (ctx->is_prefetch) {
+            int stage = -1;
+            size_t offs_src = 0;
+            id<MTLBuffer> buf_src = ggml_metal_device_wrap_host(ctx->dev, data, size, &offs_src);
+
+            if (buf_src == nil) {
+                stage = ctx->prefetch_stage_cur;
+                ctx->prefetch_stage_cur = (ctx->prefetch_stage_cur + 1) % ctx->prefetch_stage_count;
+
+                if (ctx->prefetch_stage_cmds[stage]) {
+                    [ctx->prefetch_stage_cmds[stage] waitUntilCompleted];
+                    [ctx->prefetch_stage_cmds[stage] release];
+                    ctx->prefetch_stage_cmds[stage] = nil;
+                }
+
+                buf_src = ctx->prefetch_stages[stage];
+                if (buf_src == nil || buf_src.length < size) {
+                    [buf_src release];
+                    buf_src = [device newBufferWithLength:size
+                                                  options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+                    ctx->prefetch_stages[stage] = buf_src;
+                }
+
+                if (buf_src != nil) {
+                    memcpy(buf_src.contents, data, size);
+                    offs_src = 0;
+                }
+            }
+
+            if (buf_src != nil) {
+                id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+                id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+                [encoder copyFromBuffer:buf_src
+                           sourceOffset:offs_src
+                               toBuffer:bid_dst.metal
+                      destinationOffset:bid_dst.offs
+                                   size:size];
+
+                [encoder endEncoding];
+                [cmd_buf commit];
+
+                [ctx->cmd_bufs_ext addObject:cmd_buf];
+                ctx->cmd_buf_last = cmd_buf;
+                if (stage >= 0) {
+                    ctx->prefetch_stage_cmds[stage] = [cmd_buf retain];
+                }
+
+                [cmd_buf retain];
+
+                return;
+            }
+        }
+
+        // private buffers route small transfers through the device staging
+        // buffer (synchronous) instead of allocating a Metal buffer per call
+        ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (!ctx->owns_queue && !ggml_metal_buffer_is_shared(buffer->context)
+            && ggml_metal_device_stage_set(ctx->dev, bid_dst, data, size)) {
+            return;
+        }
+
+        // wrap the source data into a Metal buffer
+        id<MTLBuffer> buf_src = [device newBufferWithBytes:data
+                                                    length:size
+                                                   options:MTLResourceStorageModeShared];
+
+        GGML_ASSERT(buf_src);
+
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
@@ -349,14 +495,13 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    @autoreleasepool {
-        id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
+    if (size == 0) {
+        return;
+    }
 
-        GGML_ASSERT(buf_dst);
+    @autoreleasepool {
+        ggml_metal_prof_note(tensor->name, size, true);
+        id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
 
         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
         if (bid_src.metal == nil) {
@@ -365,34 +510,360 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         bid_src.offs += offset;
 
-        // queue the copy operation into the queue of the Metal context
-        // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        // private buffers route small transfers through the device staging
+        // buffer (synchronous) instead of allocating a Metal buffer per call
+        ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (!ggml_metal_buffer_is_shared(buffer->context)
+            && ggml_metal_device_stage_get(ctx->dev, bid_src, data, size)) {
+            return;
+        }
 
-        [encoder copyFromBuffer:bid_src.metal
-                   sourceOffset:bid_src.offs
-                       toBuffer:buf_dst
-              destinationOffset:0
-                           size:size];
+        id<MTLCommandQueue> queue = ctx->queue;
 
-        [encoder endEncoding];
-        [cmd_buf commit];
-        [buf_dst release];
+        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
+                                                          length:size
+                                                         options:MTLResourceStorageModeShared
+                                                     deallocator:nil];
 
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
+        if (buf_dst != nil) {
+            // queue the copy operation into the queue of the Metal context
+            // this will be queued at the end, after any currently ongoing GPU operations
+            id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
-        // instead, remember a reference to the command buffer and wait for it later if needed
-        [ctx->cmd_bufs_ext addObject:cmd_buf];
-        ctx->cmd_buf_last = cmd_buf;
+            [encoder copyFromBuffer:bid_src.metal
+                       sourceOffset:bid_src.offs
+                           toBuffer:buf_dst
+                  destinationOffset:0
+                               size:size];
 
-        [cmd_buf retain];
+            [encoder endEncoding];
+            [cmd_buf commit];
+            [buf_dst release];
+
+            // do not wait here for completion
+            //[cmd_buf waitUntilCompleted];
+
+            // instead, remember a reference to the command buffer and wait for it later if needed
+            [ctx->cmd_bufs_ext addObject:cmd_buf];
+            ctx->cmd_buf_last = cmd_buf;
+
+            [cmd_buf retain];
+
+            return;
+        }
+
+        // newBufferWithBytesNoCopy requires page-aligned data, and some drivers cap the size of
+        // host-visible allocations; copy through a small staging buffer in chunks instead. The
+        // staging path is synchronous (commit + waitUntilCompleted) so callers that would later
+        // wait on cmd_buf_last still observe a completed transfer.
+        size_t stage_size = MIN(size, (size_t) 8*1024*1024);
+        id<MTLBuffer> buf_stage = nil;
+        while (stage_size > 0) {
+            buf_stage = [device newBufferWithLength:stage_size options:MTLResourceStorageModeShared];
+            if (buf_stage != nil) {
+                break;
+            }
+            stage_size /= 2;
+        }
+        if (buf_stage == nil) {
+            GGML_LOG_ERROR("%s: failed to allocate staging buffer, size = %zu\n", __func__, size);
+        }
+        GGML_ASSERT(buf_stage);
+
+        for (size_t done = 0; done < size;) {
+            const size_t n = MIN(stage_size, size - done);
+
+            id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+            {
+                id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+                [encoder copyFromBuffer:bid_src.metal
+                           sourceOffset:bid_src.offs + done
+                               toBuffer:buf_stage
+                      destinationOffset:0
+                                   size:n];
+
+                [encoder endEncoding];
+            }
+
+            [cmd_buf commit];
+            [cmd_buf waitUntilCompleted];
+
+            memcpy((char *) data + done, buf_stage.contents, n);
+
+            done += n;
+        }
     }
 }
 
+static struct ggml_metal_xdev_link * ggml_metal_xdev_link_get(
+        ggml_metal_t ctx_src, ggml_metal_t ctx_dst) {
+    struct ggml_metal_xdev_link * link = NULL;
+    for (int i = 0; i < ctx_dst->n_xlinks; i++) {
+        if (ctx_dst->xlinks[i].src_dev == ctx_src->dev) {
+            link = &ctx_dst->xlinks[i];
+            break;
+        }
+    }
+    if (link == NULL) {
+        if (ctx_dst->n_xlinks == 4) {
+            return NULL;
+        }
+        link = &ctx_dst->xlinks[ctx_dst->n_xlinks++];
+        link->src_dev = ctx_src->dev;
+        id<MTLDevice> dev_src = ggml_metal_device_get_obj(ctx_src->dev);
+        id<MTLDevice> dev_dst = ggml_metal_device_get_obj(ctx_dst->dev);
+        link->ev_ready = [dev_src newSharedEvent];
+        link->ev_done  = [dev_dst newSharedEvent];
+        if (link->ev_ready == nil || link->ev_done == nil) {
+            [link->ev_ready release];
+            [link->ev_done release];
+            memset(link, 0, sizeof(*link));
+            ctx_dst->n_xlinks--;
+            return NULL;
+        }
+    }
+
+    return link;
+}
+
+// Direct copy between GPUs in the same Metal peer group.
+static bool ggml_metal_cpy_xdev_peer(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+                                     const struct ggml_tensor * src, struct ggml_tensor * dst) {
+#if TARGET_OS_OSX
+    if (@available(macOS 10.15, *)) {
+        id<MTLDevice> dev_src = ggml_metal_device_get_obj(ctx_src->dev);
+        id<MTLDevice> dev_dst = ggml_metal_device_get_obj(ctx_dst->dev);
+        const uint64_t peer_group = dev_src.peerGroupID;
+        if (peer_group == 0 || peer_group != dev_dst.peerGroupID) {
+            return false;
+        }
+
+        struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
+        struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
+        if (bid_src.metal == nil || bid_dst.metal == nil) {
+            return false;
+        }
+        id<MTLBuffer> metal_src = (id<MTLBuffer>) bid_src.metal;
+        id<MTLBuffer> metal_dst = (id<MTLBuffer>) bid_dst.metal;
+
+        const size_t size = ggml_nbytes(src);
+        if (bid_src.offs > metal_src.length || size > metal_src.length - bid_src.offs ||
+            bid_dst.offs > metal_dst.length || size > metal_dst.length - bid_dst.offs) {
+            return false;
+        }
+
+        struct ggml_metal_xdev_link * link = ggml_metal_xdev_link_get(ctx_src, ctx_dst);
+        if (link == NULL) {
+            return false;
+        }
+
+        if (link->peer_src != metal_src) {
+            // Wait before replacing a remote view still used by the last blit.
+            if (link->peer_view != nil && link->seq > 0 &&
+                ![link->ev_done waitUntilSignaledValue:link->seq timeoutMS:10000]) {
+                return false;
+            }
+
+            [link->peer_view release];
+            [link->peer_src release];
+            link->peer_view = [metal_src newRemoteBufferViewForDevice:dev_dst];
+            link->peer_src  = link->peer_view != nil ? [metal_src retain] : nil;
+            if (link->peer_view == nil) {
+                return false;
+            }
+        }
+
+        const uint64_t seq = ++link->seq;
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd_src = [ctx_src->queue commandBuffer];
+            [cmd_src encodeSignalEvent:link->ev_ready value:seq];
+            [cmd_src commit];
+            [ctx_src->cmd_bufs_ext addObject:cmd_src];
+            ctx_src->cmd_buf_last = cmd_src;
+            [cmd_src retain];
+
+            id<MTLCommandBuffer> cmd_dst = [ctx_dst->queue commandBuffer];
+            [cmd_dst encodeWaitForEvent:link->ev_ready value:seq];
+            id<MTLBlitCommandEncoder> encoder = [cmd_dst blitCommandEncoder];
+            [encoder copyFromBuffer:link->peer_view sourceOffset:bid_src.offs
+                           toBuffer:metal_dst destinationOffset:bid_dst.offs size:size];
+            [encoder endEncoding];
+            [cmd_dst encodeSignalEvent:link->ev_done value:seq];
+            [cmd_dst commit];
+            [ctx_dst->cmd_bufs_ext addObject:cmd_dst];
+            ctx_dst->cmd_buf_last = cmd_dst;
+            [cmd_dst retain];
+        }
+
+        if (!link->peer_logged) {
+            // fprintf, not GGML_LOG_INFO, so the confirmation shows at the default
+            // log level like the SIMD-width line. Deduped by peer group across contexts:
+            // a tool that reloads the model per run rebuilds the link every time.
+            static uint64_t logged[8];
+            static int      n_logged = 0;
+
+            bool seen = false;
+            for (int i = 0; i < n_logged; ++i) {
+                seen = seen || logged[i] == peer_group;
+            }
+
+            if (!seen) {
+                fprintf(stderr, "ggml_metal: Infinity Fabric peer transfer enabled: %s -> %s (peer group %llu)\n",
+                        dev_src.name.UTF8String, dev_dst.name.UTF8String,
+                        (unsigned long long) peer_group);
+                if (n_logged < (int) (sizeof(logged)/sizeof(logged[0]))) {
+                    logged[n_logged++] = peer_group;
+                }
+            }
+
+            link->peer_logged = true;
+        }
+        return true;
+    }
+#else
+    GGML_UNUSED(ctx_src);
+    GGML_UNUSED(ctx_dst);
+    GGML_UNUSED(src);
+    GGML_UNUSED(dst);
+#endif
+    return false;
+}
+
+// event-chained hand-off: both blits share one host block and order through
+// MTLSharedEvents, so neither GPU drains and the CPU never blocks
+static bool ggml_metal_cpy_xdev_events(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+                                       const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
+    struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
+    if (bid_src.metal == nil || bid_dst.metal == nil) {
+        return false;
+    }
+
+    const size_t size = ggml_nbytes(src);
+
+    struct ggml_metal_xdev_link * link = ggml_metal_xdev_link_get(ctx_src, ctx_dst);
+    if (link == NULL) {
+        return false;
+    }
+    if (link->cap == 0) {
+        GGML_LOG_INFO("%s: cross-device hand-off via shared events and host staging (TOSH_MGPU_EVENTS)\n", __func__);
+    }
+
+    if (link->cap < size) {
+        // resizing frees pages a queued blit may still read; wait out the link first
+        if (link->seq > 0 && ![link->ev_done waitUntilSignaledValue:link->seq timeoutMS:10000]) {
+            return false;
+        }
+        [link->wrap_src release];
+        [link->wrap_dst release];
+        free(link->host);
+        link->cap = MAX(size, (size_t) 1*1024*1024);
+        if (posix_memalign(&link->host, (size_t) sysconf(_SC_PAGESIZE), link->cap) != 0) {
+            link->host = NULL;
+            link->cap  = 0;
+            return false;
+        }
+        id<MTLDevice> dev_src = ggml_metal_device_get_obj(ctx_src->dev);
+        id<MTLDevice> dev_dst = ggml_metal_device_get_obj(ctx_dst->dev);
+        link->wrap_src = [dev_src newBufferWithBytesNoCopy:link->host
+                              length:link->cap options:MTLResourceStorageModeShared deallocator:nil];
+        link->wrap_dst = [dev_dst newBufferWithBytesNoCopy:link->host
+                              length:link->cap options:MTLResourceStorageModeShared deallocator:nil];
+        if (link->wrap_src == nil || link->wrap_dst == nil) {
+            return false;
+        }
+    }
+
+    const uint64_t seq = ++link->seq;
+
+    @autoreleasepool {
+        // reuse the host block only after the destination consumed the last hand-off
+        id<MTLCommandBuffer> cmd_src = [ctx_src->queue commandBuffer];
+        if (seq > 1) {
+            [cmd_src encodeWaitForEvent:link->ev_done value:seq - 1];
+        }
+        id<MTLBlitCommandEncoder> enc_src = [cmd_src blitCommandEncoder];
+        [enc_src copyFromBuffer:bid_src.metal sourceOffset:bid_src.offs
+                       toBuffer:link->wrap_src destinationOffset:0 size:size];
+        [enc_src endEncoding];
+        [cmd_src encodeSignalEvent:link->ev_ready value:seq];
+        [cmd_src commit];
+        [ctx_src->cmd_bufs_ext addObject:cmd_src];
+        ctx_src->cmd_buf_last = cmd_src;
+        [cmd_src retain];
+
+        id<MTLCommandBuffer> cmd_dst = [ctx_dst->queue commandBuffer];
+        [cmd_dst encodeWaitForEvent:link->ev_ready value:seq];
+        id<MTLBlitCommandEncoder> enc_dst = [cmd_dst blitCommandEncoder];
+        [enc_dst copyFromBuffer:link->wrap_dst sourceOffset:0
+                       toBuffer:bid_dst.metal destinationOffset:bid_dst.offs size:size];
+        [enc_dst endEncoding];
+        [cmd_dst encodeSignalEvent:link->ev_done value:seq];
+        [cmd_dst commit];
+        [ctx_dst->cmd_bufs_ext addObject:cmd_dst];
+        ctx_dst->cmd_buf_last = cmd_dst;
+        [cmd_dst retain];
+    }
+
+    return true;
+}
+
 bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    // A Metal blit can't reach a buffer owned by another device, so a multi-GPU layer
+    // hand-off goes through host memory (GGML_METAL_CROSS_STAGING_DISABLE uses the generic copy).
+    if (ctx_src->dev != ctx_dst->dev) {
+        if (getenv("GGML_METAL_CROSS_STAGING_DISABLE") != NULL) {
+            return false;
+        }
+
+        // both buffers must be private for the cross-device blits
+        static int use_events = -1;
+        if (use_events < 0) {
+            const char * v = getenv("TOSH_MGPU_EVENTS");
+            use_events = (v && v[0] == '1') ? 1 : 0;
+        }
+        // Infinity Fabric peer copy is opt-in until validated on bridged hardware:
+        // a success that silently returns wrong data has no fallback.
+        static int use_peer = -1;
+        if (use_peer < 0) {
+            const char * v = getenv("TOSH_MGPU_PEER");
+            use_peer = (v && v[0] == '1') ? 1 : 0;
+        }
+        ggml_backend_buffer_t ebsrc = src->view_src ? src->view_src->buffer : src->buffer;
+        ggml_backend_buffer_t ebdst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+        if (!ggml_metal_buffer_is_shared(ebsrc->context) &&
+            !ggml_metal_buffer_is_shared(ebdst->context)) {
+            if (use_peer && ggml_metal_cpy_xdev_peer(ctx_src, ctx_dst, src, dst)) {
+                return true;
+            }
+            if (use_events && ggml_metal_cpy_xdev_events(ctx_src, ctx_dst, src, dst)) {
+                return true;
+            }
+        }
+        // drain both GPUs: the source before reading it, the destination before
+        // overwriting an input its in-flight graph may still be consuming
+        ggml_metal_synchronize(ctx_src);
+        ggml_metal_synchronize(ctx_dst);
+
+        ggml_backend_buffer_t bsrc = src->view_src ? src->view_src->buffer : src->buffer;
+        ggml_backend_buffer_t bdst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+        ggml_metal_buffer_t buf_src = (ggml_metal_buffer_t) bsrc->context;
+        ggml_metal_buffer_t buf_dst = (ggml_metal_buffer_t) bdst->context;
+
+        const size_t size = ggml_nbytes(src);
+        void * stage = malloc(size);
+        if (!stage) {
+            return false;
+        }
+        ggml_metal_buffer_get_tensor(buf_src, src, stage, 0, size);
+        ggml_metal_buffer_set_tensor(buf_dst, dst, stage, 0, size);
+        free(stage);
+        return true;
+    }
+
     @autoreleasepool {
         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
         struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
@@ -403,7 +874,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         // queue the copy operation into the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx_src->dev);
+        id<MTLCommandQueue> queue = ctx_src->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
@@ -504,7 +975,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         // short-hand
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
 
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
@@ -626,7 +1097,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
         ggml_metal_event_encode_signal(ev, cmd_buf);
@@ -642,7 +1113,7 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
         ggml_metal_event_encode_wait(ev, cmd_buf);
