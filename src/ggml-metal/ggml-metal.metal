@@ -9134,7 +9134,41 @@ kernel void kernel_cpy_t_t(
     }
 }
 
+// same copy with both sides contiguous: the general kernel spends ~900 integer instructions
+// per element rebuilding the 4D index, which this one does not need. nk0 is the element count
+template<typename T0, typename T1>
+kernel void kernel_cpy_contig_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int64_t i = (int64_t) tgpig[0]*ntg[0] + tpitg.x;
+
+    if (i >= args.nk0) {
+        return;
+    }
+
+    ((device T1 *) dst)[i] = cpy_cast<T1>(((device const T0 *) src0)[i]);
+}
+
 typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
+
+template [[host_name("kernel_cpy_contig_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   float>;
+template [[host_name("kernel_cpy_contig_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   half>;
+template [[host_name("kernel_cpy_contig_f32_i32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   int32_t>;
+template [[host_name("kernel_cpy_contig_i32_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<int32_t, float>;
+template [[host_name("kernel_cpy_contig_i32_i32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<int32_t, int32_t>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_cpy_contig_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   bfloat>;
+#endif
+template [[host_name("kernel_cpy_contig_f16_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<half,    float>;
+template [[host_name("kernel_cpy_contig_f16_f16")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<half,    half>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_cpy_contig_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_contig_t_t<bfloat,  float>;
+template [[host_name("kernel_cpy_contig_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_contig_t_t<bfloat,  bfloat>;
+#endif
 
 template [[host_name("kernel_cpy_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   float>;
 template [[host_name("kernel_cpy_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   half>;
