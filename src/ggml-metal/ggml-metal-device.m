@@ -1560,6 +1560,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
+        case GGML_OP_IM2COL_3D:
+            // claiming this keeps ggml_conv_3d on im2col + mul_mat; without it the graph falls
+            // back to the direct 3D convolution, which is slow enough to trip the GPU watchdog
+            return op->src[1]->nb[0] == sizeof(float) && op->src[1]->type == GGML_TYPE_F32 &&
+                   (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]) &&
                    op->src[1]->type == GGML_TYPE_F32 &&

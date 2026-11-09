@@ -5221,6 +5221,58 @@ kernel void kernel_im2col(
 template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
 template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
 
+typedef void (im2col_3d_t)(
+        constant ggml_metal_kargs_im2col_3d & args,
+        device const char * src1,
+        device       char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
+
+// one threadgroup per output voxel; the threads walk IC*KD*KH*KW, which is contiguous in dst
+template <typename T>
+kernel void kernel_im2col_3d(
+        constant ggml_metal_kargs_im2col_3d & args,
+        device const char * src1,
+        device       char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int64_t iow = tgpig[0];
+    const int64_t ioh = tgpig[1];
+    const int64_t ind = tgpig[2]; // in*OD + iod
+
+    const int64_t in  = ind / args.OD;
+    const int64_t iod = ind - in*args.OD;
+
+    device T * pdst = (device T *) dst + (ind*args.OH*args.OW + ioh*args.OW + iow)*args.IC_KD_KH_KW;
+
+    for (int64_t idx = tpitg[0]; idx < args.IC_KD_KH_KW; idx += ntg[0]) {
+        const int64_t iic  = idx / args.KD_KH_KW;
+        const int64_t rem  = idx - iic*args.KD_KH_KW;
+        const int64_t ikd  = rem / args.KH_KW;
+        const int64_t rem2 = rem - ikd*args.KH_KW;
+        const int64_t ikh  = rem2 / args.KW;
+        const int64_t ikw  = rem2 - ikh*args.KW;
+
+        const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+        const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
+        const int64_t iid = iod*args.s2 + ikd*args.d2 - args.p2;
+
+        if (iid < 0 || iid >= args.ID || iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
+            pdst[idx] = 0;
+        } else {
+            device const char * psrc = src1 + (in*args.IC + iic)*args.nb13 + iid*args.nb12 + iih*args.nb11 + iiw*args.nb10;
+
+            pdst[idx] = (T) *((device const float *) psrc);
+        }
+    }
+}
+
+template [[host_name("kernel_im2col_3d_f32")]] kernel im2col_3d_t kernel_im2col_3d<float>;
+template [[host_name("kernel_im2col_3d_f16")]] kernel im2col_3d_t kernel_im2col_3d<half>;
+
 // TODO: optimize
 typedef void (im2col_ext_t)(
         constant ggml_metal_kargs_im2col & args,

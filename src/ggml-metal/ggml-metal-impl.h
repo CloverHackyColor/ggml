@@ -720,6 +720,34 @@ typedef struct {
 } ggml_metal_kargs_im2col;
 
 typedef struct {
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  IW;
+    int32_t  IH;
+    int32_t  ID;
+    int32_t  IC;
+    int32_t  KW;
+    int32_t  KH;
+    int32_t  OW;
+    int32_t  OH;
+    int32_t  OD;
+    int32_t  s0;
+    int32_t  s1;
+    int32_t  s2;
+    int32_t  p0;
+    int32_t  p1;
+    int32_t  p2;
+    int32_t  d0;
+    int32_t  d1;
+    int32_t  d2;
+    int32_t  KH_KW;
+    int32_t  KD_KH_KW;
+    int32_t  IC_KD_KH_KW;
+} ggml_metal_kargs_im2col_3d;
+
+typedef struct {
     int32_t  IW;
     int32_t  IH;
     int32_t  ID;
