@@ -3267,6 +3267,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             char fa_pf_pipeline[80];
             snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk%d_k%s_v%s", (int) ne00,
                      ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type));
+            // diffusion attention runs without a mask
+            static const bool fa_nomask_off = getenv("TOSH_FA_NOMASK_DISABLE") != NULL;
+            if (!fa_nomask_off && props_dev->simd_width == 32 && (ne00 == 64 || ne00 == 128) && !has_mask && !has_sinks &&
+                op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16) {
+                snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_nomask_dk%d", (int) ne00);
+            }
 
             auto pipeline = ggml_metal_library_get_pipeline(lib, fa_pf_pipeline);
             if (!pipeline.pipeline) {

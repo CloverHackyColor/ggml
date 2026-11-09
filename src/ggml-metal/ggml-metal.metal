@@ -9003,6 +9003,201 @@ FA_AMD_PF_PAIR("kf16_vq4_0",  half4,      1, dequantize_f16_t4,  block_q4_0, 8, 
 FA_AMD_PF_PAIR("kq8_0_vq4_0", block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_PF_PAIR("kq4_0_vq8_0", block_q4_0, 8, dequantize_q4_0_t4, block_q8_0, 8, dequantize_q8_0_t4)
 
+// pf_amd for f16 K/V without mask or sinks: no mask paths, and K and V loaded together into
+// their own LDS regions; same arithmetic and result
+template<short DK, short BQ, short BK, short NT>
+kernel void kernel_flash_attn_ext_pf_amd_nomask(
+        constant ggml_metal_kargs_flash_attn_ext_vec & args [[buffer(0)]],
+        device const char * q     [[buffer(1)]],
+        device const char * k     [[buffer(2)]],
+        device const char * v     [[buffer(3)]],
+        device const char * mask  [[buffer(4)]],
+        device const char * sinks [[buffer(5)]],
+        device const char * pad   [[buffer(6)]],
+        device       char * dst   [[buffer(7)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]]) {
+    constexpr short DK4 = DK/4;
+    constexpr short NQG = NT/16;
+    constexpr short NQR = BQ/NQG;
+    constexpr short NKC = BK/16;
+    constexpr short NDC = DK/16;
+    constexpr short SQS = DK + 4;
+    constexpr short SVS = BK + 4;
+
+    threadgroup half sq[BQ*SQS];
+    threadgroup half sk[BK*SQS];
+    threadgroup half sv[DK*SVS];  // V transposed
+    threadgroup half sp[BQ*SVS];  // softmax weights
+
+    const short kg = tiitg % 16;
+    const short qg = tiitg / 16;
+
+    const int iq1 = tgpig.x*BQ;
+    const int iq2 = tgpig.y;
+    const int iq3 = tgpig.z;
+
+    const int ikv2 = iq2 / (args.ne02 / args.ne_12_2);
+    const int ikv3 = iq3 / (args.ne03 / args.ne_12_3);
+
+    device const char * kp = k + ikv2*args.nb12 + ikv3*args.nb13;
+    device const char * vp = v + ikv2*args.nb22 + ikv3*args.nb23;
+
+    for (short c = tiitg; c < BQ*DK4; c += NT) {
+        const short jq = c / DK4;
+        const short ch = c % DK4;
+        float4 qv = 0.0f;
+        if (iq1 + jq < args.ne01) {
+            qv = ((device const float4 *) (q + (iq1 + jq)*args.nb01 + iq2*args.nb02 + iq3*args.nb03))[ch]*args.scale;
+        }
+        *(threadgroup half4 *) (sq + jq*SQS + 4*ch) = (half4) qv;
+    }
+
+    float m   [NQR];
+    float srun[NQR];
+    float acc [NQR][NDC];
+    for (short rr = 0; rr < NQR; ++rr) {
+        m[rr]    = -FLT_MAX/2;
+        srun[rr] = 0.0f;
+        for (short dd = 0; dd < NDC; ++dd) {
+            acc[rr][dd] = 0.0f;
+        }
+    }
+
+    for (int j0 = 0; j0 < args.ne11; j0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short c = tiitg; c < BK*DK4; c += NT) {
+            const short jj = c / DK4;
+            const short ch = c % DK4;
+            *(threadgroup half4 *) (sk + jj*SQS + 4*ch) = j0 + jj < args.ne11
+                ? ((device const half4 *) (kp + (uint64_t)(j0 + jj)*args.nb11))[ch] : (half4) 0.0h;
+        }
+        for (short c = tiitg; c < (BK/2)*DK4; c += NT) {
+            const short jj = 2*(c / DK4);
+            const short ch = c % DK4;
+            const half4 t0 = j0 + jj < args.ne11
+                ? ((device const half4 *) (vp + (uint64_t)(j0 + jj)*args.nb21))[ch] : (half4) 0.0h;
+            const half4 t1 = j0 + jj + 1 < args.ne11
+                ? ((device const half4 *) (vp + (uint64_t)(j0 + jj + 1)*args.nb21))[ch] : (half4) 0.0h;
+            for (short e = 0; e < 4; ++e) {
+                *(threadgroup half2 *) (sv + (4*ch + e)*SVS + jj) = half2(t0[e], t1[e]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float sc[NQR][NKC];
+        {
+            half2 pacc[NQR][NKC];
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short cc = 0; cc < NKC; ++cc) {
+                    pacc[rr][cc] = 0.0h;
+                }
+            }
+            FOR_UNROLL (short d = 0; d < DK; d += 2) {
+                half2 av[NQR];
+                half2 bv[NKC];
+                for (short rr = 0; rr < NQR; ++rr) {
+                    av[rr] = *(threadgroup const half2 *) (sq + (qg + NQG*rr)*SQS + d);
+                }
+                for (short cc = 0; cc < NKC; ++cc) {
+                    bv[cc] = *(threadgroup const half2 *) (sk + (kg + 16*cc)*SQS + d);
+                }
+                for (short rr = 0; rr < NQR; ++rr) {
+                    for (short cc = 0; cc < NKC; ++cc) {
+                        pacc[rr][cc] = av[rr]*bv[cc] + pacc[rr][cc];
+                    }
+                }
+            }
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short cc = 0; cc < NKC; ++cc) {
+                    sc[rr][cc] = 0.0f + ((float) pacc[rr][cc][0] + (float) pacc[rr][cc][1]);
+                }
+            }
+        }
+
+        for (short rr = 0; rr < NQR; ++rr) {
+            const short row = qg + NQG*rr;
+            float mx = -FLT_MAX;
+            for (short cc = 0; cc < NKC; ++cc) {
+                if (j0 + kg + 16*cc >= args.ne11) {
+                    sc[rr][cc] = -INFINITY;
+                }
+                mx = max(mx, sc[rr][cc]);
+            }
+            for (ushort o = 1; o < 16; o <<= 1) {
+                mx = max(mx, simd_shuffle_xor(mx, o));
+            }
+
+            const float mn   = max(m[rr], mx);
+            const float corr = exp(m[rr] - mn);
+
+            float ls = 0.0f;
+            for (short cc = 0; cc < NKC; ++cc) {
+                const float w = exp(sc[rr][cc] - mn);
+                sp[row*SVS + kg + 16*cc] = (half) w;
+                ls += w;
+            }
+            for (ushort o = 1; o < 16; o <<= 1) {
+                ls += simd_shuffle_xor(ls, o);
+            }
+
+            m[rr]    = mn;
+            srun[rr] = srun[rr]*corr + ls;
+            for (short dd = 0; dd < NDC; ++dd) {
+                acc[rr][dd] *= corr;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            half2 pacc[NQR][NDC];
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short dd = 0; dd < NDC; ++dd) {
+                    pacc[rr][dd] = 0.0h;
+                }
+            }
+            FOR_UNROLL (short jj = 0; jj < BK; jj += 2) {
+                half2 pv[NQR];
+                half2 vv[NDC];
+                for (short rr = 0; rr < NQR; ++rr) {
+                    pv[rr] = *(threadgroup const half2 *) (sp + (qg + NQG*rr)*SVS + jj);
+                }
+                for (short dd = 0; dd < NDC; ++dd) {
+                    vv[dd] = *(threadgroup const half2 *) (sv + (kg + 16*dd)*SVS + jj);
+                }
+                for (short rr = 0; rr < NQR; ++rr) {
+                    for (short dd = 0; dd < NDC; ++dd) {
+                        pacc[rr][dd] = pv[rr]*vv[dd] + pacc[rr][dd];
+                    }
+                }
+            }
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short dd = 0; dd < NDC; ++dd) {
+                    acc[rr][dd] += (float) pacc[rr][dd][0] + (float) pacc[rr][dd][1];
+                }
+            }
+        }
+    }
+
+    device float * dst1 = (device float *) dst;
+    for (short rr = 0; rr < NQR; ++rr) {
+        const int iq = iq1 + qg + NQG*rr;
+        if (iq >= args.ne01) {
+            continue;
+        }
+        const float inv = srun[rr] > 0.0f ? 1.0f/srun[rr] : 0.0f;
+        const int64_t rid = (int64_t) iq3*args.ne2*args.ne1 + iq2 + (int64_t) iq*args.ne1;
+        for (short dd = 0; dd < NDC; ++dd) {
+            dst1[rid*DK + kg + 16*dd] = acc[rr][dd]*inv;
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_ext_pf_amd_nomask<128, 64, 64, 256>) flash_attn_ext_pf_amd_nomask_t;
+
+template [[host_name("kernel_flash_attn_ext_pf_amd_nomask_dk64")]]  kernel flash_attn_ext_pf_amd_nomask_t kernel_flash_attn_ext_pf_amd_nomask< 64, 64, 64, 256>;
+template [[host_name("kernel_flash_attn_ext_pf_amd_nomask_dk128")]] kernel flash_attn_ext_pf_amd_nomask_t kernel_flash_attn_ext_pf_amd_nomask<128, 64, 64, 256>;
+
 // vision towers, f16 only like the vec and tile kernels
 FA_AMD_PF_INST(72, 64, 64, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
 // UNet diffusion heads (SD 1.5 runs 40 at full resolution, then 80 and 160), f16 only
