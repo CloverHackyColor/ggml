@@ -720,6 +720,16 @@ typedef struct {
 } ggml_metal_kargs_im2col;
 
 typedef struct {
+    int32_t  OW;
+    int32_t  OH;
+    int32_t  IC;
+    int32_t  TW;
+    int32_t  CB;
+    int32_t  nblk;
+    int32_t  ncols;
+} ggml_metal_kargs_im2col_tile;
+
+typedef struct {
     uint64_t nb10;
     uint64_t nb11;
     uint64_t nb12;

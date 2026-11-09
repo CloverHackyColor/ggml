@@ -5246,6 +5246,131 @@ kernel void kernel_im2col(
 template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
 template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
 
+// one threadgroup per output pixel; the threads walk IC*KH*KW, which is contiguous in dst
+template <typename T>
+kernel void kernel_im2col_px(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int iow = tgpig[0];
+    const int ioh = tgpig[1];
+    const int in  = tgpig[2];
+
+    device T * pdst = (device T *) dst + ((int64_t) (in*tgpg[1] + ioh)*tgpg[0] + iow)*args.CHW;
+    device const float * px = x + in*args.ofs0;
+
+    for (int idx = tpitg[0]; idx < args.CHW; idx += ntg[0]) {
+        const int iic = idx / args.KHW;
+        const int rem = idx - iic*args.KHW;
+        const int ikh = rem / args.KW;
+        const int ikw = rem - ikh*args.KW;
+
+        const int iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+        const int iih = ioh*args.s1 + ikh*args.d1 - args.p1;
+
+        pdst[idx] = (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW)
+            ? (T) 0.0f : (T) px[iic*args.ofs1 + (int64_t) iih*args.IW + iiw];
+    }
+}
+
+template [[host_name("kernel_im2col_px_f32")]] kernel im2col_t kernel_im2col_px<float>;
+template [[host_name("kernel_im2col_px_f16")]] kernel im2col_t kernel_im2col_px<half>;
+
+static inline void im2col_st8(device half * p, half4 a, half4 b) {
+    *((device uint4 *) p) = uint4(as_type<uint2>(a), as_type<uint2>(b));
+}
+
+static inline void im2col_st8(device float * p, float4 a, float4 b) {
+    ((device float4 *) p)[0] = a;
+    ((device float4 *) p)[1] = b;
+}
+
+// 3x3 only: the threadgroup stages its input columns as [kh][col][channel], so each thread reads
+// 8 channels at a time and writes their 72 contiguous outputs with 16-byte stores
+template <typename T>
+kernel void kernel_im2col_tile(
+        constant ggml_metal_kargs_im2col      & args,
+        constant ggml_metal_kargs_im2col_tile & ta,
+        device const float * x,
+        device        char * dst,
+        threadgroup   char * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    typedef vec<T, 4> T4;
+    threadgroup T * sh = (threadgroup T *) shmem;
+
+    const int cb  = tgpig[0] % ta.nblk;
+    const int ow0 = (tgpig[0] / ta.nblk)*ta.TW;
+    const int oh  = tgpig[1];
+    const int in  = tgpig[2];
+
+    const int c0  = cb*ta.CB;
+    const int nc  = min(ta.CB, ta.IC - c0);
+    const int npx = min(ta.TW, ta.OW - ow0);
+    const int ncols = ta.ncols;
+    const int PC  = ta.CB + 8;
+
+    device const float * px = x + in*args.ofs0 + (int64_t) c0*args.ofs1;
+    const int iw0 = ow0*args.s0 - args.p0;
+
+    for (int r = tiitg/32; r < nc*3; r += ntg[0]/32) {
+        const int c   = r/3;
+        const int kh  = r - c*3;
+        const int iih = oh*args.s1 + kh*args.d1 - args.p1;
+        const bool rok = iih >= 0 && iih < args.IH;
+        device const float * prow = px + c*args.ofs1 + (int64_t) iih*args.IW;
+        for (int col = tiitg%32; col < ncols; col += 32) {
+            const int iiw = iw0 + col;
+            sh[(kh*ncols + col)*PC + c] = (!rok || iiw < 0 || iiw >= args.IW) ? (T) 0.0f : (T) prow[iiw];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ncg = nc/8;
+    device T * pdst = (device T *) dst + ((int64_t) (in*ta.OH + oh)*ta.OW + ow0)*args.CHW + c0*9;
+    for (int f = tiitg; f < npx*ncg; f += ntg[0]) {
+        const int p  = f/ncg;
+        const int cg = f - p*ncg;
+        T4 A[9];
+        T4 B[9];
+        for (int k = 0; k < 9; ++k) {
+            threadgroup const T4 * s4 = (threadgroup const T4 *) (sh + ((k/3)*ncols + p*args.s0 + (k%3)*args.d0)*PC + cg*8);
+            A[k] = s4[0];
+            B[k] = s4[1];
+        }
+        device T * o = pdst + (int64_t) p*args.CHW + cg*72;
+        for (int m = 0; m < 9; ++m) {
+            T4 v0;
+            T4 v1;
+            for (int j = 0; j < 4; ++j) {
+                const int i0 = 8*m + j;
+                const int i1 = i0 + 4;
+                v0[j] = i0/9 < 4 ? A[i0%9][i0/9] : B[i0%9][i0/9 - 4];
+                v1[j] = i1/9 < 4 ? A[i1%9][i1/9] : B[i1%9][i1/9 - 4];
+            }
+            im2col_st8(o + 8*m, v0, v1);
+        }
+    }
+}
+
+typedef void (im2col_tile_t)(
+        constant ggml_metal_kargs_im2col      & args,
+        constant ggml_metal_kargs_im2col_tile & ta,
+        device const float * x,
+        device        char * dst,
+        threadgroup   char * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_im2col_tile_f32")]] kernel im2col_tile_t kernel_im2col_tile<float>;
+template [[host_name("kernel_im2col_tile_f16")]] kernel im2col_tile_t kernel_im2col_tile<half>;
+
 typedef void (im2col_3d_t)(
         constant ggml_metal_kargs_im2col_3d & args,
         device const char * src1,

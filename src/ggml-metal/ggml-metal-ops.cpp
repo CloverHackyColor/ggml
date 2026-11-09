@@ -4437,9 +4437,53 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
         /*.KHW  =*/ KH * KW,
     };
 
+    // the tile kernel keeps its staged input under 16 KB of threadgroup memory
+    static const bool tile_off = getenv("TOSH_IM2COL_TILE_DISABLE") != nullptr;
+    const int esz = op->type == GGML_TYPE_F16 ? 2 : 4;
+    int TW = 64;
+    if (3*((TW - 1)*s0 + 2*d0 + 1)*(32 + 8)*esz > 16384) {
+        TW = 32;
+    }
+    const int ncols = (TW - 1)*s0 + 2*d0 + 1;
+    if (!tile_off && is_2D && KH == 3 && KW == 3 && IC % 8 == 0 && 3*ncols*(32 + 8)*esz <= 16384) {
+        ggml_metal_kargs_im2col_tile targs = {
+            /*.OW    =*/ OW,
+            /*.OH    =*/ OH,
+            /*.IC    =*/ IC,
+            /*.TW    =*/ TW,
+            /*.CB    =*/ 32,
+            /*.nblk  =*/ (IC + 31)/32,
+            /*.ncols =*/ ncols,
+        };
+
+        auto pipeline = ggml_metal_library_get_pipeline_im2col_tile(lib, op);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args,  sizeof(args),  0);
+        ggml_metal_encoder_set_bytes   (enc, &targs, sizeof(targs), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 3*ncols*(32 + 8)*esz, 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, targs.nblk*((OW + TW - 1)/TW), OH, N, 256, 1, 1);
+
+        return 1;
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
 
-    if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+    static const bool px_off = getenv("TOSH_IM2COL_PX_DISABLE") != nullptr;
+    if (!px_off && KH*KW <= 1024) {
+        const int nth = std::min<int>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), std::min(256, (CHW + 31)/32*32));
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, OW, OH, N, nth, 1, 1);
+    } else if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);

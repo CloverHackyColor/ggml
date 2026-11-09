@@ -1998,11 +1998,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
     char base[256];
     char name[256];
 
+    static const bool px_off = getenv("TOSH_IM2COL_PX_DISABLE") != nullptr;
     if (KH*KW <= 1024) {
-        snprintf(base, 256, "kernel_im2col_%s", ggml_type_name(op->type));
+        snprintf(base, 256, px_off ? "kernel_im2col_%s" : "kernel_im2col_px_%s", ggml_type_name(op->type));
     } else {
         snprintf(base, 256, "kernel_im2col_ext_%s", ggml_type_name(op->type));
     }
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col_tile(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_IM2COL);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_im2col_tile_%s", ggml_type_name(op->type));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
