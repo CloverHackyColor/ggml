@@ -3113,9 +3113,14 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     // Keeps quantized KV on the GPU instead of the CPU fallback. Gated by TOSH_FA_AMD.
     char fa_amd_pipeline[80] = {0};
     // dk 72 is instantiated for f16 K/V only (vision towers); see the .metal side.
-    const bool fa_amd_dk72 = ne00 == 72 &&
+    const bool fa_amd_f16_kv =
         op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16;
-    if (ne00 == ne20 && (ne00 == 64 || ne00 == 128 || ne00 == 256 || ne00 == 512 || fa_amd_dk72)) {
+    const bool fa_amd_dk72 = ne00 == 72 && fa_amd_f16_kv;
+    // UNet diffusion heads, f16 only like dk72: SD 1.5 runs 40 at full resolution,
+    // where building the score matrix costs 2.7 GB at 768 and does not fit at 1024
+    const bool fa_amd_unet = (ne00 == 40 || ne00 == 80 || ne00 == 160) && fa_amd_f16_kv;
+    if (ne00 == ne20 && (ne00 == 64 || ne00 == 128 || ne00 == 256 || ne00 == 512 ||
+                         fa_amd_dk72 || fa_amd_unet)) {
         const char * ks = ggml_metal_fa_amd_type_suffix(op->src[1]->type);
         const char * vs = ggml_metal_fa_amd_type_suffix(op->src[2]->type);
         if (ks && vs && ggml_metal_fa_amd_pair_ok(op->src[1]->type, op->src[2]->type)) {
@@ -3170,9 +3175,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         };
 
         // queries per threadgroup, matching the instantiation for this head size
-        const int fa_pf_bq = ne00 == 256 ? 32 : 64;
+        const int fa_pf_bq = (ne00 == 256 || ne00 == 160) ? 32 : 64;
         const bool fa_pf_head_ok =
-            ne00 == 64 || ne00 == 128 || ne00 == 256 || fa_amd_dk72;
+            ne00 == 64 || ne00 == 128 || ne00 == 256 || fa_amd_dk72 || fa_amd_unet;
         if (ne01 >= 32 && fa_pf_head_ok && getenv("TOSH_FA_PF_DISABLE") == NULL) {
             char fa_pf_pipeline[80];
             snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk%d_k%s_v%s", (int) ne00,

@@ -8313,6 +8313,9 @@ FA_AMD_PAIR_Q4("kq4_0_vq8_0",       block_q4_0,     8,  dequantize_q4_0_t4,     
 #define FA_AMD_INST_W64(dk, nsg, nm, kt, nkk, dkf, vt, nkv, dvf) \
 template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_" nm "_w64")]] kernel flash_attn_ext_vec_amd_t \
     kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 64>;
+#define FA_AMD_INST_W64_S(dk, nsg, subw, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_" nm "_w64")]] kernel flash_attn_ext_vec_amd_t \
+    kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 64, 1, subw>;
 #define FA_AMD_PAIR_W64(nm, kt, nkk, dkf, vt, nkv, dvf) \
     FA_AMD_INST_W64( 64, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
     FA_AMD_INST_W64(128,  8, nm, kt, nkk, dkf, vt, nkv, dvf) \
@@ -8327,6 +8330,14 @@ FA_AMD_PAIR_W64("kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4, block_q8_0, 8,
 // pin subw=16 and let the ch < DV4 guards cover the top two chunks.
 FA_AMD_INST_S  (72, 32, 16, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
 FA_AMD_INST_W64(72, 16, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+// UNet diffusion heads. Like dk72 these are not whole 32-element blocks, so subw is
+// pinned to a power of two that divides the simd width and the tail chunk is guarded.
+FA_AMD_INST_S  ( 40, 32,  8, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_INST_W64_S( 40, 16,  8, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_INST_S  ( 80, 32, 16, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_INST_W64_S( 80, 16, 16, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_INST_S  (160, 16, 32, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_INST_W64_S(160,  8, 32, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
 FA_AMD_PAIR_W64("kq4_0_vq4_0", block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_PAIR_W64("kq8_0_vf16",  block_q8_0, 8, dequantize_q8_0_t4, half4,      1, dequantize_f16_t4)
 FA_AMD_PAIR_W64("kq4_0_vf16",  block_q4_0, 8, dequantize_q4_0_t4, half4,      1, dequantize_f16_t4)
@@ -8576,7 +8587,7 @@ kernel void kernel_flash_attn_ext_pf_amd(
     constexpr short NQR = BQ/NQG;
     constexpr short NKC = BK/16;
     constexpr short NDC = (DK + 15)/16;  // DK 72 (vision) leaves the top lanes idle
-    constexpr short DKF = DK > 128 ? 128 : DK;  // cap the half2 run before flushing to float
+    constexpr short DKF = DK % 128 == 0 ? 128 : (DK % 64 == 0 ? 64 : DK);  // must divide DK, or the run reads past the row
     constexpr short SQS = DK + 4;
     constexpr short SVS = BK + 4;
     constexpr short SKV = BK*SQS > DK*SVS ? BK*SQS : DK*SVS;
@@ -8844,6 +8855,10 @@ FA_AMD_PF_PAIR("kq4_0_vq8_0", block_q4_0, 8, dequantize_q4_0_t4, block_q8_0, 8, 
 
 // vision towers, f16 only like the vec and tile kernels
 FA_AMD_PF_INST(72, 64, 64, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+// UNet diffusion heads (SD 1.5 runs 40 at full resolution, then 80 and 160), f16 only
+FA_AMD_PF_INST( 40, 64, 64, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_INST( 80, 64, 64, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_INST(160, 32, 64, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
 #undef FA_AMD_PF_PAIR
 #undef FA_AMD_PF_INST
 

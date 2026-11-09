@@ -1624,7 +1624,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 : wave64_decode;
             if (getenv("TOSH_FA_AMD") != NULL &&
                 !has_simdgroup_mm && fa_amd_width_ok &&
-                (op->src[0]->ne[0] % 32 == 0 || op->src[0]->ne[0] == 72)) {
+                (op->src[0]->ne[0] % 32 == 0 || op->src[0]->ne[0] == 72 ||
+                 op->src[0]->ne[0] == 40 || op->src[0]->ne[0] == 80 || op->src[0]->ne[0] == 160)) {
                 float max_bias = 0.0f;
                 float softcap  = 0.0f;
                 memcpy(&max_bias, ((const int32_t *) op->op_params) + 1, sizeof(float));
@@ -1640,7 +1641,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 // 32-element quant blocks, so K/V can never be quantized there.
                 const bool f16_kv = kt == GGML_TYPE_F16 && vt == GGML_TYPE_F16;
                 const bool dk_ok =
-                    dk == 64 || dk == 128 || dk == 256 || dk == 512 || (dk == 72 && f16_kv);
+                    dk == 64 || dk == 128 || dk == 256 || dk == 512 || (dk == 72 && f16_kv) ||
+                    // UNet diffusion heads (SD 1.5): not whole quant blocks, so f16 only
+                    ((dk == 40 || dk == 80 || dk == 160) && f16_kv);
                 const bool simple =
                     dk_ok &&
                     op->src[2]->ne[0] == dk &&
