@@ -28,7 +28,7 @@
 #define N_SG_Q2_0 2
 
 #define N_R0_Q4_0 4
-#define N_SG_Q4_0 2
+#define N_SG_Q4_0 1
 
 #define N_R0_Q4_1 4
 #define N_SG_Q4_1 2
@@ -54,8 +54,8 @@
 #define N_R0_Q4_K 2
 #define N_SG_Q4_K 2
 
-#define N_R0_Q5_K 1
-#define N_SG_Q5_K 2
+#define N_R0_Q5_K 2
+#define N_SG_Q5_K 1
 
 #define N_R0_Q6_K 2
 #define N_SG_Q6_K 2
@@ -437,6 +437,8 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+    int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {
