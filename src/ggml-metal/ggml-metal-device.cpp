@@ -817,6 +817,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const bool has_tensor    = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
     const bool use_mm_manual = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->use_mm_manual;
     const bool use_mm_double_buffer = use_mm_manual && getenv("GGML_METAL_MM_DOUBLE_BUFFER_DISABLE") == nullptr;
+    const int  simd_width    = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
 
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
@@ -828,16 +829,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    // half the token tile when the batch cannot fill it, so the group does not compute padding.
-    // it needs the 4x4 register tile, whose mapping divides into 4 simdgroups at 32 tokens
     const bool narrow = use_mm_manual && !has_tensor && tsrc1 == GGML_TYPE_F32 && op->ne[1] <= 32;
 
-    // The 8x4 tile halves the simdgroups per threadgroup, so it needs enough tokens to keep
-    // the GPU in threadgroups; below ~192 it loses (measured 8.7% at 64 tokens on q8_0).
     bool wide = use_mm_manual && !has_tensor && !narrow && tsrc1 == GGML_TYPE_F32 &&
                 op->ne[1] >= 192 && getenv("TOSH_MM_WIDE_DISABLE") == nullptr;
     if (wide) {
-        // it needs 64 accumulators, so only where the dequant leaves the registers
         switch (tsrc0) {
             case GGML_TYPE_F16:
             case GGML_TYPE_Q8_0:
@@ -851,15 +847,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         }
     }
 
-    // attention matmuls read a permuted KV cache view and can exceed half range in the packed
-    // accumulator; bfloat has no native arithmetic here, so float is faster for it too
-    // diffusion activations overflow half partials on some models, so float stays the default;
-    // TOSH_MM_ACC_HALF opts a model validated in half back into the faster path
     static const bool acc_half = getenv("TOSH_MM_ACC_HALF") != nullptr;
     const bool acc_f32 = use_mm_manual &&
                          (!acc_half || !ggml_is_contiguous(op->src[0]) || tsrc0 == GGML_TYPE_BF16);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), wide ? "_w" : "");
+    // Polaris/GCN (wave64): one-wave 64x64 prefill tile, q4_K/q6_K x f32 (ToshLLM PR#149).
+    // Аддитивно: прочие типы/формы идут старым путём. TOSH_MM_MW_DISABLE=1 — откат.
+    const bool mw = simd_width == 64 && use_mm_manual && !has_tensor &&
+                    (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) &&
+                    tsrc1 == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    !bc_inp && op->src[0]->ne[0] % 256 == 0 &&
+                    (tsrc0 != GGML_TYPE_Q4_K || op->src[0]->nb[1] % 16 == 0) &&
+                    op->ne[1] >= 192 &&
+                    getenv("TOSH_MM_MW_DISABLE") == nullptr;
+
+    if (mw) {
+        const char* kernel_name = (tsrc0 == GGML_TYPE_Q4_K) ? "kernel_mul_mm_mw" :
+                                  (tsrc0 == GGML_TYPE_Q5_K) ? "kernel_mul_mm_mw5" :
+                                                              "kernel_mul_mm_mw6";
+        snprintf(base, 256, "%s", kernel_name);
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), wide ? "_w" : "");
+    }
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_mm=%d_db=%d_af=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3, use_mm_manual + 2*narrow, use_mm_double_buffer, acc_f32);
 
@@ -867,20 +876,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
-        ggml_metal_cv_set_bool(cv, narrow, FC_MUL_MM + 7);
-        ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
-        ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
-        ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
-        ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
-        ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
-        ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
-        ggml_metal_cv_set_bool(cv, use_mm_manual, FC_MUL_MM + 6);
-        ggml_metal_cv_set_bool(cv, use_mm_double_buffer, FC_MUL_MM + 8);
-        ggml_metal_cv_set_bool(cv, acc_f32, FC_MUL_MM + 9);
+        if (!mw) {
+            ggml_metal_cv_set_bool(cv, narrow, FC_MUL_MM + 7);
+            ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
+            ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
+            ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
+            ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
+            ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
+            ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
+            ggml_metal_cv_set_bool(cv, use_mm_manual, FC_MUL_MM + 6);
+            ggml_metal_cv_set_bool(cv, use_mm_double_buffer, FC_MUL_MM + 8);
+            ggml_metal_cv_set_bool(cv, acc_f32, FC_MUL_MM + 9);
+        }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
+    }
+
+    if (mw) {
+        res.nr0  = 64;
+        res.nr1  = 64;
+        res.smem = 8192;      // MW_BUF = 2048 float
+        res.nsg  = 2;         // 32*2 == 64
+        return res;
     }
 
     if (has_tensor) {
@@ -900,7 +919,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     return res;
 }
-
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);

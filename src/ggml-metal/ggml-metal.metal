@@ -12944,6 +12944,68 @@ static inline void mw_load_a4(device const char * wrow, int loop_k, bool rowok,
     q[14] = (uchar) ((v.w >> 16) & 0xFu);  q[15] = (uchar) ((v.w >> 24) & 0xFu);
 }
 
+
+#define MW_Q5K_BYTES 176 // 2(d) + 2(dmin) + 12(scales) + 32(qh) + 128(qs)
+
+// Загружает 16 значений Q5_K и сразу вычисляет готовые float
+#define MW_Q5K_BYTES 176  // 2(d) + 2(dmin) + 12(scales) + 32(qh) + 128(qs)
+
+static inline void mw_load_a5(device const char * wrow, int loop_k, bool rowok, thread float * q_float) {
+    const int bi = loop_k / 256;
+    device const uchar * blk = (device const uchar *) (wrow + (uint64_t) bi * MW_Q5K_BYTES);
+
+    const float d    = (float) *(device const half *) (blk + 0);
+    const float dmin = (float) *(device const half *) (blk + 2);
+
+    device const uchar * scales = blk + 4;
+    device const uchar * qh     = blk + 16;
+    device const uchar * qs     = blk + 48;
+
+    const int L0 = loop_k % 256;  // панель из 16 всегда внутри одного супер-блока
+
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        const int L  = L0 + i;
+        const int il = L / 64;          // 0..3
+        const int r  = L % 64;          // 0..63
+        const int rs = r % 32;          // смещение внутри группы из 32
+
+        // Точный layout из dequantize_q5_K:
+        const int qs_byte = 32*il + rs;
+        const int qh_byte = rs;
+        const int hm_bit  = 2*il + (r >= 32 ? 1 : 0);
+        const int shift   = (r < 32) ? 0 : 4;   // low nibble vs high nibble
+        const int sc_idx  = hm_bit;             // scale_idx == hm_bit
+
+        // get_scale_min_k4 (эталон из ggml)
+        float sc, mn;
+        if (sc_idx < 4) {
+            sc = (float)(scales[sc_idx] & 63);
+            mn = (float)(scales[sc_idx + 4] & 63);
+        } else {
+            sc = (float)((scales[sc_idx + 4] & 0xF) | ((scales[sc_idx - 4] >> 6) << 4));
+            mn = (float)((scales[sc_idx + 4] >> 4) | ((scales[sc_idx] >> 6) << 4));
+        }
+
+        const float d1 = d * sc;
+        const float m1 = dmin * mn;
+
+        const int q_val  = (qs[qs_byte] >> shift) & 0xF;
+        const int qh_val = (qh[qh_byte] >> hm_bit) & 1;
+        const int final_q = q_val + (qh_val ? 16 : 0);
+
+        q_float[i] = rowok ? (d1 * (float)final_q - m1) : 0.f;
+    }
+}
+
+// Сохраняет готовые float в shared memory (специально для Q5_K)
+static inline void mw_store_a_f(threadgroup float * sa, const thread float * q_float, int arow) {
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        sa[i * 64 + arow] = q_float[i];
+    }
+}
+
 // the same panel of a q6_K row. Its 6-bit values live in two 128-byte halves that a 16-value
 // span reaches through a byte-aligned window, and the value carries a +32 bias.
 static inline void mw_load_a6(device const char * wrow, int loop_k, bool rowok,
@@ -12987,10 +13049,20 @@ static inline void mw_load_a(device const char * wrow, int loop_k, bool rowok,
     else         mw_load_a4(wrow, loop_k, rowok, dsc, dbia, q);
 }
 
+
+// Сохраняет уже готовые float в shared memory
+// Для Q4_K и Q6_K (старая сигнатура)
 static inline void mw_store_a(threadgroup float * sa, const thread uchar * q, int arow,
                               float dsc, float dbia) {
     #pragma unroll
     for (int i = 0; i < MW_KT; i++) sa[i*64 + arow] = dsc*(float) q[i] + dbia;
+}
+
+// Для Q5_K (новая сигнатура)
+static inline void mw_store_a(threadgroup float * sa, const thread float * q_float, int arow,
+                              float /* dsc unused */, float /* dbia unused */) {
+    #pragma unroll
+    for (int i = 0; i < MW_KT; i++) sa[i*64 + arow] = q_float[i];
 }
 
 static inline void mw_load_b(device const char * abase, uint64_t nb11, int r1, int loop_k,
@@ -13076,30 +13148,47 @@ static inline void mw_tile(
 
     float dsc, dbia;
     uchar qa[MW_KT];
+    float qa_f[MW_KT]; // Новый массив только для Q5_K
     float4 bq[MW_NV4];
     const int nb = ne00 / MW_KT;
 
     // q6_K keeps the one-piece load: its panel needs two byte-aligned windows plus the int8 scale,
     // which does not fit the same issue/decode split without costing more than it saves.
     constexpr bool SP = (QT == 0);
+    constexpr bool SP5 = (QT == 2);   // Q5_K: простая загрузка без split
     uint4 rawH, rawV;
 
-    if (SP) mw_issue_a4(wrow, 0, true, rawH, rawV);
-    else    mw_load_a<QT>(wrow, 0, rowok, dsc, dbia, qa);
-    mw_load_b(abase, args.nb11, r1, 0, bcol0, bkg, ne1, bq);
-    if (SP) mw_decode_a4(rawH, rawV, 0, rowok, dsc, dbia, qa);
-    mw_store_a(sa, qa, lane, dsc, dbia);
+    // Начальная загрузка (i=0):
+    if (SP) {
+        mw_issue_a4(wrow, 0, true, rawH, rawV);
+        mw_load_b(abase, args.nb11, r1, 0, bcol0, bkg, ne1, bq);
+        mw_decode_a4(rawH, rawV, 0, rowok, dsc, dbia, qa);
+        mw_store_a(sa, qa, lane, dsc, dbia);
+    } else if (SP5) {
+        mw_load_a5(wrow, 0, rowok, qa_f);
+        mw_load_b(abase, args.nb11, r1, 0, bcol0, bkg, ne1, bq);
+        mw_store_a_f(sa, qa_f, lane);
+    } else {
+        // Q6_K
+        mw_load_a<QT>(wrow, 0, rowok, dsc, dbia, qa);
+        mw_load_b(abase, args.nb11, r1, 0, bcol0, bkg, ne1, bq);
+        mw_store_a(sa, qa, lane, dsc, dbia);
+    }
     mw_store_b(sb, bq, bkg, bcol0);
     simdgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int i = 0; i < nb; i++) {
         const bool more = (i + 1) < nb;
 
-        // the next panel's loads are issued before the fma loop below and decoded after it, so the
-        // memory wait lands behind the arithmetic instead of in front of it
+        // Загружаем следующую панель ПЕРЕД FMA-циклом
         if (more) {
-            if (SP) mw_issue_a4(wrow, (i + 1)*MW_KT, (((i + 1) & (MW_QK_K/MW_KT - 1)) == 0), rawH, rawV);
-            else    mw_load_a<QT>(wrow, (i + 1)*MW_KT, rowok, dsc, dbia, qa);
+            if (SP) {
+                mw_issue_a4(wrow, (i + 1)*MW_KT, (((i + 1) & (MW_QK_K/MW_KT - 1)) == 0), rawH, rawV);
+            } else if (SP5) {
+                mw_load_a5(wrow, (i + 1)*MW_KT, rowok, qa_f);
+            } else {
+                mw_load_a<QT>(wrow, (i + 1)*MW_KT, rowok, dsc, dbia, qa);
+            }
             mw_load_b(abase, args.nb11, r1, (i + 1)*MW_KT, bcol0, bkg, ne1, bq);
         }
 
@@ -13116,10 +13205,20 @@ static inline void mw_tile(
             }
         }
 
+        // Сохраняем загруженную панель ПОСЛЕ FMA-цикла
         if (more) {
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            if (SP) mw_decode_a4(rawH, rawV, (i + 1)*MW_KT, rowok, dsc, dbia, qa);
-            mw_store_a(sa, qa, lane, dsc, dbia);
+            if (SP) {
+                // Q4_K: декодируем из rawH/rawV и сохраняем
+                mw_decode_a4(rawH, rawV, (i + 1)*MW_KT, rowok, dsc, dbia, qa);
+                mw_store_a(sa, qa, lane, dsc, dbia);
+            } else if (SP5) {
+                // Q5_K: qa_f уже содержит готовые float, просто сохраняем
+                mw_store_a_f(sa, qa_f, lane);
+            } else {
+                // Q6_K: qa уже заполнен в mw_load_a<QT>, просто сохраняем
+                mw_store_a(sa, qa, lane, dsc, dbia);
+            }
             mw_store_b(sb, bq, bkg, bcol0);
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -13154,6 +13253,7 @@ kernel void NAME(                                                               
 }
 
 MW_KERNEL(kernel_mul_mm_mw,  0)
+MW_KERNEL(kernel_mul_mm_mw5, 2) // Q5_K 
 MW_KERNEL(kernel_mul_mm_mw6, 1)
 
 //
